@@ -3,9 +3,10 @@ python = {}
 
 [phases.setup]
 nixPkgs = ["python3", "google-chrome", "chromium", "chromedriver"]
+aptPkgs = ["libnss3", "libatk-bridge2.0-0", "libgtk-3-0", "libxss1", "libasound2"]
 
 [phases.build]
 cmds = ["pip install -r requirements.txt"]
 
 [start]
-cmd = "python main.py -a accounts.txt -l links.txt --headless --verbose"
+cmd = "python main.py -a accounts.txt -l links.txt --headless --no-sandbox --verbose"
