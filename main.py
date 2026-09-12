@@ -7,222 +7,117 @@ import os
 import random
 import sys
 import time
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
-
 from tqdm import tqdm
 
 from args import cmdline_args
-from bot import RedditBot, BotConfig, GhostLogger
-from bot.reporting import ExecutionSummary, send_webhook, setup_structured_logger
-from bot.utils.credentials import read_accounts, read_accounts_from_env, Account
+from bot import BotConfig, GhostLogger
+from bot.reporting import ExecutionSummary, setup_structured_logger
 from bot.utils.input_parser import parse_links_file, ActionEntry
-from bot.utils.timeouts import Timeouts
+from openai import OpenAI
 
+# إعداد الذكاء الاصطناعي المجاني عبر OpenRouter
+ai_client = OpenAI(
+    base_url="https://openrouter.ai",
+    api_key=os.getenv("OPENAI_API_KEY")
+)
 
-def load_config(args: dict) -> BotConfig:
-    """Build BotConfig from config file, env vars, and CLI args (in that priority order)."""
-    config = BotConfig()
+def get_ai_comment(post_title, prompt_style):
+    try:
+        response = ai_client.chat.completions.create(
+            model="deepseek/deepseek-chat-free",
+            messages=[{"role": "user", "content": f"{prompt_style} for this Reddit post title: '{post_title}'. Keep it short, natural, and casual."}]
+        )
+        return response.choices.message.content
+    except:
+        return "Wow, that's really interesting! Thanks for sharing."
 
-    if args.get("config"):
-        config = BotConfig.from_yaml(args["config"])
+def run_api_bot(username, password, entries, logger):
+    """تشغيل البوت بنظام الطلبات السريع والخفيف بدون متصفح كروم"""
+    logger.info(f"Initializing API session for user: {username}")
+    
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+    
+    login_url = "https://reddit.com"
+    login_data = {'user': username, 'passwd': password, 'api_type': 'json'}
+    
+    res = session.post(login_url, data=login_data)
+    if "invalid_grant" in res.text or not res.ok:
+        logger.error(f"Login failed for {username}! Check your username or password.")
+        return
 
-    config.merge_env_vars()
-    config.merge_cli_args(args)
+    logger.info(f"[SUCCESS] Logged in successfully to Reddit as {username}!")
 
-    return config
-
-
-def load_accounts(config: BotConfig) -> list[Account]:
-    """Load accounts from file or environment variables."""
-    # Try environment variables first
-    env_accounts = read_accounts_from_env()
-    if env_accounts:
-        return env_accounts
-
-    if not config.accounts_path:
-        return []
-
-    return read_accounts(
-        config.accounts_path,
-        encrypted=config.encrypt_credentials,
-        passphrase=os.environ.get(config.credentials_key_env),
-    )
-
-
-def run_account(
-    account: Account,
-    entries: list[ActionEntry],
-    config: BotConfig,
-    logger: logging.Logger,
-) -> ExecutionSummary:
-    """Run all actions for a single account. Used for both sequential and parallel execution."""
-    with RedditBot(config=config) as bot:
-        # Try session restore first
-        if not bot.login_with_session(account.username):
-            try:
-                bot.login(account.username, account.password)
-            except RuntimeError:
-                logger.error(f"Login failed for {account.username}")
-                return bot.summary
-
-        # Execute actions
-        action_list = list(entries)
-        if config.randomize_actions:
-            random.shuffle(action_list)
-
-        for entry in action_list:
-            kwargs = {"link": entry.link}
-            if entry.comment:
-                kwargs["comment"] = entry.comment
-            if entry.title:
-                kwargs["title"] = entry.title
-            if entry.subreddit:
-                kwargs["subreddit"] = entry.subreddit
-            if entry.body:
-                kwargs["body"] = entry.body
-            if entry.flair:
-                kwargs["flair"] = entry.flair
-            if entry.recipient:
-                kwargs["recipient"] = entry.recipient
-            if entry.message:
-                kwargs["message"] = entry.message
-
-            result = bot.perform_action(entry.action, **kwargs)
-            if config.verbose:
-                logger.info(str(result))
-
-        return bot.summary
-
-
-def run_scheduled(config: BotConfig, accounts: list[Account], entries: list[ActionEntry], logger) -> None:
-    """Run the bot on a cron schedule."""
-    import sched
-    import re
-
-    def parse_simple_interval(cron_expr: str) -> int:
-        """Parse a simple cron-like interval. Supports '*/N' in hours position."""
-        match = re.search(r'\*/(\d+)', cron_expr)
-        if match:
-            hours = int(match.group(1))
-            return hours * 3600
-        # Default to 6 hours
-        return 6 * 3600
-
-    interval = parse_simple_interval(config.schedule_cron)
-    logger.info(f"Scheduled mode: running every {interval // 3600} hours")
-
-    scheduler = sched.scheduler(time.time, time.sleep)
-
-    def scheduled_run():
-        logger.info("Starting scheduled run...")
-        _execute_run(config, accounts, entries, logger)
-        scheduler.enter(interval, 1, scheduled_run)
-
-    scheduler.enter(0, 1, scheduled_run)
-    scheduler.run()
-
-
-def _execute_run(
-    config: BotConfig,
-    accounts: list[Account],
-    entries: list[ActionEntry],
-    logger,
-) -> ExecutionSummary:
-    """Execute the full run (all accounts, all actions)."""
-    combined_summary = ExecutionSummary()
-
-    if config.parallel_accounts > 1:
-        # Parallel execution
-        logger.info(f"Running {len(accounts)} accounts in parallel (max {config.parallel_accounts} workers)")
-        with ThreadPoolExecutor(max_workers=config.parallel_accounts) as executor:
-            futures = {
-                executor.submit(run_account, acc, entries, config, logger): acc
-                for acc in accounts
-            }
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Accounts", disable=not config.verbose):
-                account = futures[future]
-                try:
-                    summary = future.result()
-                    for r in summary.results:
-                        combined_summary.add(r)
-                except Exception as e:
-                    logger.error(f"Account {account.username} failed: {e}")
-    else:
-        # Sequential execution
-        for acc in tqdm(accounts, desc="Accounts", disable=not config.verbose):
-            summary = run_account(acc, entries, config, logger)
-            for r in summary.results:
-                combined_summary.add(r)
-
-            # Staggered delay between accounts
-            if acc != accounts[-1]:
-                Timeouts.custom(
-                    config.rate_limit.min_account_delay,
-                    config.rate_limit.max_account_delay,
-                )
-
-    combined_summary.finalize()
-    return combined_summary
-
+    for entry in entries:
+        sub_url = entry.link
+        prompt_style = entry.comment if entry.comment else "Write a cool response"
+        sub_name = sub_url.split('/r/')[-1].split('/')[0]
+        
+        logger.info(f"Fetching hot posts from r/{sub_name}")
+        
+        feed_url = f"https://reddit.com{sub_name}/hot.json?limit=5"
+        try:
+            feed_res = session.get(feed_url).json()
+            posts = feed_res['data']['children']
+            
+            for post in posts[:2]:  # التعليق على أول منشورين
+                post_data = post['data']
+                post_id = post_data['id']
+                title = post_data['title']
+                
+                comment_text = get_ai_comment(title, prompt_style)
+                
+                comment_data = {'thing_id': f't3_{post_id}', 'text': comment_text, 'api_type': 'json'}
+                comment_res = session.post("https://reddit.com", data=comment_data)
+                
+                if comment_res.ok:
+                    logger.info(f"[SUCCESS] Commented on: '{title}' in r/{sub_name}")
+                else:
+                    logger.warning(f"[FAILED] Could not comment on post: {post_id}")
+                
+                # فاصل زمني آمن لعدم الحظر (من 3 إلى 7 دقائق)
+                time.sleep(random.randint(180, 420))
+        except Exception as e:
+            logger.warning(f"Skipped r/{sub_name} due to an error: {e}")
+            continue
 
 def main() -> None:
     args = cmdline_args()
-    config = load_config(args)
+    config = BotConfig()
+    config.merge_cli_args(args)
 
-    # Logger
-    logger = GhostLogger()
-    if config.verbose:
-        logger = setup_structured_logger("reddit-bot", level=logging.INFO)
+    logger = setup_structured_logger("reddit-bot", level=logging.INFO)
 
-    # Load accounts
-    accounts = load_accounts(config)
-    if not accounts:
-        logger.error("No accounts provided. Use -a/--accounts or REDDIT_ACCOUNT_N env vars.")
+    # جلب الحساب مباشرة من المتغيرات السرية المضافة للسيرفر لتفادي أي أخطاء ملفات
+    username = os.getenv("REDDIT_USERNAME")
+    password = os.getenv("REDDIT_PASSWORD")
+
+    if not username or not password:
+        logger.error("Reddit credentials missing in environment variables! Please add REDDIT_USERNAME and REDDIT_PASSWORD in Railway.")
         sys.exit(1)
 
-    # Load actions
     if not config.links_path:
-        logger.error("No links file provided. Use -l/--links.")
-        sys.exit(1)
+        config.links_path = "links.txt"
 
     entries = parse_links_file(config.links_path)
     if not entries:
-        logger.error("No actions found in links file.")
+        logger.error("No actions found in links file 'links.txt'.")
         sys.exit(1)
 
-    logger.info(f"Loaded {len(accounts)} accounts and {len(entries)} actions")
+    logger.info(f"Loaded 1 account from env and {len(entries)} actions from links.txt")
 
-    if config.dry_run:
-        logger.info("DRY RUN MODE — no actions will be executed")
-
-    # Scheduled or one-shot
-    if config.schedule_cron:
-        run_scheduled(config, accounts, entries, logger)
-    else:
-        summary = _execute_run(config, accounts, entries, logger)
-
-        # Print summary
-        if config.verbose:
-            print(summary.print_table())
-
-        # Webhook notification
-        if config.webhook.enabled and config.webhook.url:
-            success = send_webhook(
-                config.webhook.url,
-                summary,
-                on_completion=config.webhook.on_completion,
-                on_failure=config.webhook.on_failure,
-            )
-            if success:
-                logger.info("Webhook notification sent")
-            else:
-                logger.warning("Webhook notification failed")
-
-        # Exit with error code if any actions failed
-        if summary.failed > 0:
-            sys.exit(1)
-
+    # إطلاق البوت السريع
+    while True:
+        try:
+            run_api_bot(username, password, entries, logger)
+            logger.info("Finished one complete cycle. Waiting 30 minutes before next run...")
+            time.sleep(1800)
+        except Exception as e:
+            logger.error(f"Main loop exception: {e}")
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()
