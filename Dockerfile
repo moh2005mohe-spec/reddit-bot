@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# تثبيت الاعتماديات ومتصفح كروم عبر المستودع الافتراضي المستقر والمباشر
+# تثبيت الاعتماديات الحديثة الأساسية فقط وتنزيل متصفح كروم المستقر
 RUN apt-get update && apt-get install -y \
     wget \
     curl \
@@ -8,7 +8,6 @@ RUN apt-get update && apt-get install -y \
     unzip \
     libglib2.0-0 \
     libnss3 \
-    libgconf-2-4 \
     libfontconfig1 \
     libxrender1 \
     libxtst6 \
@@ -18,7 +17,7 @@ RUN apt-get update && apt-get install -y \
     libxss1 \
     libasound2 \
     && curl -fsSL https://google.com | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-    && echo "deb [arch=amd64] https://google.com stable main" > /etc/apt/sources.list.d/google-chrome.list \
+    && echo "deb [arch=amd64] http://google.com stable main" > /etc/apt/sources.list.d/google-chrome.list \
     && apt-get update \
     && apt-get install -y google-chrome-stable \
     && apt-get clean \
@@ -33,5 +32,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # نسخ جميع ملفات المشروع
 COPY . .
 
-# أمر التشغيل المباشر للبوت في الوضع الآمن لبيئات السيرفرات
+# أمر التشغيل المباشر الآمن
 CMD ["python", "main.py", "-a", "accounts.txt", "-l", "links.txt", "--headless", "--no-sandbox", "--verbose"]
